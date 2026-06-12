@@ -1,0 +1,18 @@
+{
+  "name": "perplexity-mcp",
+  "version": "1.1.0",
+  "description": "MCP server & CLI for Perplexity API — search, ask, research, reason",
+  "type": "module",
+  "bin": {
+    "perplexity": "src/cli.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch src/index.ts",
+    "cli": "bun run src/cli.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.23.8"
+  }
+}
