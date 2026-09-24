@@ -6,17 +6,18 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, renameSync } from "fs";
+import { join } from "path";
 
 // ============================================================================
-// Configuration — override via env vars
+// Configuration
 // ============================================================================
 
+const TODAY = new Date().toISOString().slice(0, 10);
 const BASE_URL = process.env.PERPLEXITY_BASE_URL ?? "http://localhost:3030/v1";
-const TIMEOUT_MS = Number(process.env.PERPLEXITY_TIMEOUT_MS ?? 300_000);
+const TIMEOUT_MS = Number(process.env.PERPLEXITY_TIMEOUT_MS ?? 900_000);
 const API_KEY = process.env.PERPLEXITY_API_KEY ?? "";
-
-const QUERY_POLICY =
-  "\n\nInclude today's date in the query when temporal context matters (e.g. \"as of 2026-06-13, what is...\"). This grounds the search in current time. The tool also auto-injects date context as a safety net, but explicit is better.";
+const JOB_DIR = "/tmp/perplexity-jobs";
 
 const RECENCY_VALUES = ["hour", "day", "week", "month"] as const;
 
@@ -27,6 +28,47 @@ const RECENCY_VALUES = ["hour", "day", "week", "month"] as const;
 interface Message {
   role: string;
   content: string;
+}
+
+interface Job {
+  id: string;
+  status: "pending" | "done" | "error";
+  query: string;
+  result?: string;
+  error?: string;
+  created: number;
+  finished?: number;
+}
+
+// ============================================================================
+// Job helpers
+// ============================================================================
+
+function ensureJobDir() {
+  mkdirSync(JOB_DIR, { recursive: true });
+}
+
+function jobPath(id: string) {
+  return join(JOB_DIR, `${id}.json`);
+}
+
+function writeJob(job: Job) {
+  ensureJobDir();
+  const tmp = jobPath(job.id) + ".tmp";
+  writeFileSync(tmp, JSON.stringify(job, null, 2));
+  renameSync(tmp, jobPath(job.id));
+}
+
+function readJob(id: string): Job | null {
+  try {
+    return JSON.parse(readFileSync(jobPath(id), "utf-8")) as Job;
+  } catch {
+    return null;
+  }
+}
+
+function makeJobId(query: string): string {
+  return query.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40);
 }
 
 // ============================================================================
@@ -70,7 +112,7 @@ function validateMessages(messages: unknown): asserts messages is Message[] {
 // ============================================================================
 
 function buildSystemMessage(extra?: string): Message {
-  const date = new Date().toISOString().slice(0, 10);
+  const date = TODAY;
   let content = `Today's date is ${date}.`;
   if (extra) content += ` ${extra}`;
   return { role: "system", content };
@@ -90,13 +132,11 @@ function stripThinkingTokens(content: string): string {
   return content.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
 }
 
-
 interface CompletionOptions {
   messages: Message[];
   model: string;
   stripThinking?: boolean;
   systemExtra?: string;
-  // Search params
   recencyFilter?: string;
   searchDomainFilter?: string[];
   searchContextSize?: string;
@@ -104,14 +144,12 @@ interface CompletionOptions {
   searchType?: string;
   searchLanguageFilter?: string[];
   enableSearchClassifier?: boolean;
-  // Generation params
   responseFormat?: Record<string, unknown>;
   temperature?: number;
   maxTokens?: number;
   topP?: number;
   frequencyPenalty?: number;
   presencePenalty?: number;
-  // Response enrichment
   languagePreference?: string;
   returnImages?: boolean;
   returnRelatedQuestions?: boolean;
@@ -132,7 +170,6 @@ async function performChatCompletion(opts: CompletionOptions): Promise<string> {
   const finalMessages = mergeSystemMessage(messages, systemMsg);
 
   const body: Record<string, unknown> = { model, messages: finalMessages };
-  // Search params
   if (recencyFilter && RECENCY_VALUES.includes(recencyFilter as (typeof RECENCY_VALUES)[number])) {
     body.search_recency_filter = recencyFilter;
   }
@@ -142,14 +179,12 @@ async function performChatCompletion(opts: CompletionOptions): Promise<string> {
   if (searchType) body.search_type = searchType;
   if (searchLanguageFilter?.length) body.search_language_filter = searchLanguageFilter;
   if (enableSearchClassifier !== undefined) body.enable_search_classifier = enableSearchClassifier;
-  // Generation params
   if (responseFormat) body.response_format = responseFormat;
   if (temperature !== undefined) body.temperature = temperature;
   if (maxTokens !== undefined) body.max_tokens = maxTokens;
   if (topP !== undefined) body.top_p = topP;
   if (frequencyPenalty !== undefined) body.frequency_penalty = frequencyPenalty;
   if (presencePenalty !== undefined) body.presence_penalty = presencePenalty;
-  // Response enrichment
   if (languagePreference) body.language_preference = languagePreference;
   if (returnImages !== undefined) body.return_images = returnImages;
   if (returnRelatedQuestions !== undefined) body.return_related_questions = returnRelatedQuestions;
@@ -167,6 +202,11 @@ async function performChatCompletion(opts: CompletionOptions): Promise<string> {
       headers,
       body: JSON.stringify(body),
       signal: controller.signal,
+      // Bun has a 5-minute idle socket timeout by default. sonar-deep-research sends no
+      // streaming bytes during inference (~150–280s), so the idle timer fires before our
+      // AbortController can. Disable it — our AbortController is the real deadline.
+      // @ts-ignore Bun-specific option
+      timeout: false,
     });
     clearTimeout(timeoutId);
   } catch (error) {
@@ -202,203 +242,92 @@ async function performChatCompletion(opts: CompletionOptions): Promise<string> {
 // MCP Tool definitions
 // ============================================================================
 
-// Shared input schema fragments
-const SEARCH_FILTER_PROPS = {
-  search_domain_filter: {
-    type: "array",
-    items: { type: "string" },
-    description:
-      'Restrict search to specific domains. Prefix with "-" to exclude. Example: ["wikipedia.org", "-pinterest.com"]. Use this param for site restrictions — prose like "only search X" is ignored by the search backend.',
-  },
-  search_context_size: {
-    type: "string",
-    enum: ["low", "medium", "high"],
-    description: 'Search depth vs cost. "high" = exhaustive (more sources, slower, costlier). "low" = fast/cheap. Omit for default (medium).',
-  },
-  search_mode: {
-    type: "string",
-    enum: ["web", "academic", "sec"],
-    description: 'Search source mode. "web" = general web (default). "academic" = scholarly/research papers. "sec" = SEC filings.',
-  },
-  search_type: {
-    type: "string",
-    enum: ["fast", "pro", "auto"],
-    description: 'Search type. "fast" = quicker/cheaper. "pro" = deeper/more thorough. "auto" = model decides.',
-  },
-  search_language_filter: {
-    type: "array",
-    items: { type: "string" },
-    description: 'Filter search results by language. ISO 639-1 codes, up to 10. Example: ["en", "fr"].',
-  },
-
-} as const;
-
-const GENERATION_PROPS = {
-  temperature: {
-    type: "number",
-    description: "Sampling temperature (0 = deterministic, 2 = max randomness). Omit for model default.",
-  },
-  max_tokens: {
-    type: "integer",
-    description: "Maximum tokens in the response. Omit for no limit.",
-  },
-  top_p: {
-    type: "number",
-    description: "Nucleus sampling (0-1). Lower = more focused. Omit for default.",
-  },
-  frequency_penalty: {
-    type: "number",
-    description: "Penalize repeated tokens (-2 to 2). Cannot be used together with presence_penalty.",
-  },
-  presence_penalty: {
-    type: "number",
-    description: "Penalize tokens already present (-2 to 2). Cannot be used together with frequency_penalty.",
-  },
-  language_preference: {
-    type: "string",
-    description: 'Preferred response language as ISO 639-1 code (e.g. "en", "fr", "ja"). Omit for auto-detect.',
-  },
-  return_images: {
-    type: "boolean",
-    description: "Set to true to include image results in the response.",
-  },
-  return_related_questions: {
-    type: "boolean",
-    description: "Set to true to include related follow-up questions in the response.",
-  },
+const SEARCH_PROPS_OPTIONAL = {
+  search_context_size: { type: "string", enum: ["low", "medium", "high"], description: "Search depth. low=fast, high=exhaustive." },
+  search_mode: { type: "string", enum: ["web", "academic", "sec"], description: "Source mode: web (default), academic, sec." },
+  search_type: { type: "string", enum: ["fast", "pro", "auto"], description: "Search thoroughness." },
+  search_language_filter: { type: "array", items: { type: "string" }, description: "ISO 639-1 language codes to filter results." },
 } as const;
 
 const MESSAGES_PROP = {
   type: "array",
-  description: "Conversation history. Provide either this or 'query'.",
+  description: "Conversation history (alternative to query).",
   items: {
     type: "object",
-    properties: {
-      role: { type: "string", description: "system, user, or assistant" },
-      content: { type: "string", description: "Message content" },
-    },
+    properties: { role: { type: "string" }, content: { type: "string" } },
     required: ["role", "content"],
   },
-} as const;
-
-const RESPONSE_FORMAT_PROP = {
-  type: "object",
-  description:
-    'Enforce structured output. Must use json_schema format: { "type": "json_schema", "json_schema": { "name": "my_name", "schema": { "type": "object", "properties": {...}, "required": [...] } } }. "json_object" is NOT supported.',
 } as const;
 
 const TOOLS = [
   {
     name: "perplexity_search",
-    description:
-      `Web search with citations (sonar). Best for current events, facts, documentation, quick lookups.
-
-Prompting rules:
-- Query IS the search seed — be specific (include entities, versions, constraints)
-- Cap lists explicitly ("top 5") — vague requests scatter results
-- Don't ask for URLs in query — citations are returned separately
-- Use search_domain_filter for site restrictions (prose "only search X" is IGNORED)
-- search_context_size "high" = deeper research, "low" = faster/cheaper` + QUERY_POLICY,
+    description: `Web search restricted to specified domains (sonar). Today is ${TODAY} — always include this date in queries. Requires domain(s) to focus results.`,
     inputSchema: {
       type: "object",
       properties: {
-        query: { type: "string", description: "The search query — be specific (entities, versions, constraints). This seeds the web search." },
-        recency_filter: {
-          type: "string",
-          enum: ["hour", "day", "week", "month"],
-          description: "Limit results to recent timeframe. Omit for no restriction.",
+        query: { type: "string", description: `Search query — specific, entity-rich. Always include today's date (${TODAY}) in the query.` },
+        search_domain_filter: {
+          type: "array",
+          items: { type: "string" },
+          description: 'Required. Domain allowlist/blocklist. Prefix with "-" to exclude. E.g. ["matomo.org"] or ["-reddit.com"].',
         },
-        ...SEARCH_FILTER_PROPS,
-        ...GENERATION_PROPS,
+        recency_filter: { type: "string", enum: ["hour", "day", "week", "month"], description: "Limit to recent results." },
+        ...SEARCH_PROPS_OPTIONAL,
+      },
+      required: ["query", "search_domain_filter"],
+    },
+  },
+  {
+    name: "perplexity_research",
+    description: `Deep research across hundreds of sources (sonar-deep-research). Today is ${TODAY} — always include this date in queries. Thorough report output. Takes up to 15min — returns a job ID immediately. Use perplexity_job_status to poll and perplexity_job_get to retrieve the result.`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: `Research question — specify dimensions, cap scope. Always include today's date (${TODAY}) in the query.` },
+        messages: MESSAGES_PROP,
+        strip_thinking: { type: "boolean", description: "Strip <think> tags to save tokens.", default: false },
+        ...SEARCH_PROPS_OPTIONAL,
+        search_domain_filter: { type: "array", items: { type: "string" }, description: 'Optional domain filter. Prefix with "-" to exclude.' },
       },
       required: ["query"],
     },
   },
   {
-    name: "perplexity_ask",
-    description:
-      `Multi-turn conversation with web-grounded responses (sonar-pro). Use when prior context/messages are needed, or for follow-up questions.
-
-Prompting rules:
-- Query IS the search seed — be specific (include entities, versions, constraints)
-- Cap lists explicitly ("top 5")
-- Use search_domain_filter for site restrictions (prose is IGNORED by search backend)
-- Use response_format for machine-readable JSON output (requires json_schema, NOT json_object)
-- Don't ask for URLs in query — citations are returned separately` + QUERY_POLICY,
-    inputSchema: {
-      type: "object",
-      properties: {
-        query: {
-          type: "string",
-          description: "Simple one-shot question (shorthand for a single user message)",
-        },
-        messages: MESSAGES_PROP,
-        ...SEARCH_FILTER_PROPS,
-        response_format: RESPONSE_FORMAT_PROP,
-        ...GENERATION_PROPS,
-      },
-    },
-  },
-  {
-    name: "perplexity_research",
-    description:
-      `Deep research across hundreds of sources (sonar-deep-research). Produces thorough report-style output. May take 30-60s+.
-
-Prompting rules:
-- Frame as a research task — specify dimensions to cover (e.g. "focus on: cost, safety, scalability")
-- Be specific in the query — it seeds multi-step search; vague = scattered
-- Cap scope: "top 5 approaches" or "last 2 years" prevents unfocused sprawl
-- Use search_domain_filter for source restrictions (prose is IGNORED)
-- search_context_size "high" recommended for thorough research
-- Don't ask for URLs in query — citations are returned separately
-- Allow uncertainty: "say if info unavailable" reduces hallucination` + QUERY_POLICY,
-    inputSchema: {
-      type: "object",
-      properties: {
-        query: {
-          type: "string",
-          description: "Research question — be specific, state dimensions to cover, cap scope",
-        },
-        messages: MESSAGES_PROP,
-        strip_thinking: {
-          type: "boolean",
-          description: "Remove <think> tags from response to save context tokens.",
-          default: false,
-        },
-        ...SEARCH_FILTER_PROPS,
-        ...GENERATION_PROPS,
-      },
-    },
-  },
-  {
     name: "perplexity_reason",
-    description:
-      `Analytical reasoning with web grounding (sonar-pro). Use for evaluating options, pros/cons, logical problem-solving, decision-making.
-
-Prompting rules:
-- Frame as a decision/analysis: "evaluate X vs Y", "what are the tradeoffs of..."
-- Be specific — include constraints, context, and what matters most
-- Cap output: "give 3 options with pros/cons" prevents sprawl
-- Use response_format for structured JSON output (requires json_schema, NOT json_object)
-- Use search_domain_filter for source restrictions (prose is IGNORED)
-- Don't ask for URLs in query — citations are returned separately` + QUERY_POLICY,
+    description: `Analytical reasoning with web grounding (sonar-pro). Today is ${TODAY} — always include this date in queries. Use for tradeoffs, decisions, pros/cons. Strips <think> tags automatically.`,
     inputSchema: {
       type: "object",
       properties: {
-        query: {
-          type: "string",
-          description: "Question to reason about (shorthand for a single user message)",
-        },
+        query: { type: "string", description: `Question or decision to reason about. Always include today's date (${TODAY}) in the query.` },
         messages: MESSAGES_PROP,
-        strip_thinking: {
-          type: "boolean",
-          description: "Remove <think> tags from response to save context tokens.",
-          default: false,
-        },
-        ...SEARCH_FILTER_PROPS,
-        response_format: RESPONSE_FORMAT_PROP,
-        ...GENERATION_PROPS,
+        response_format: { type: "object", description: 'JSON schema output: { "type": "json_schema", "json_schema": {...} }' },
+        ...SEARCH_PROPS_OPTIONAL,
+        search_domain_filter: { type: "array", items: { type: "string" }, description: 'Optional domain filter. Prefix with "-" to exclude.' },
       },
+      required: ["query"],
+    },
+  },
+  {
+    name: "perplexity_job_status",
+    description: "Check the status of an async perplexity_research job. Returns: pending | done | error.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        job_id: { type: "string", description: "Job ID returned by perplexity_research." },
+      },
+      required: ["job_id"],
+    },
+  },
+  {
+    name: "perplexity_job_get",
+    description: "Retrieve the result of a completed perplexity_research job. Returns the full research report. Errors if the job is still pending or failed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        job_id: { type: "string", description: "Job ID returned by perplexity_research." },
+      },
+      required: ["job_id"],
     },
   },
 ] as const;
@@ -408,7 +337,7 @@ Prompting rules:
 // ============================================================================
 
 const server = new Server(
-  { name: "perplexity-mcp", version: "1.0.0" },
+  { name: "perplexity-mcp", version: "2.0.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -418,25 +347,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
   const a = (args ?? {}) as Record<string, unknown>;
 
-  // Extract shared optional params
   function sharedOpts(): Partial<CompletionOptions> {
     return {
-      // Search
       searchDomainFilter: Array.isArray(a.search_domain_filter) ? a.search_domain_filter as string[] : undefined,
       searchContextSize: a.search_context_size as string | undefined,
       searchMode: a.search_mode as string | undefined,
       searchType: a.search_type as string | undefined,
       searchLanguageFilter: Array.isArray(a.search_language_filter) ? a.search_language_filter as string[] : undefined,
       enableSearchClassifier: typeof a.enable_search_classifier === "boolean" ? a.enable_search_classifier : undefined,
-
-      // Generation
       responseFormat: a.response_format as Record<string, unknown> | undefined,
       temperature: typeof a.temperature === "number" ? a.temperature : undefined,
       maxTokens: typeof a.max_tokens === "number" ? a.max_tokens : undefined,
       topP: typeof a.top_p === "number" ? a.top_p : undefined,
       frequencyPenalty: typeof a.frequency_penalty === "number" ? a.frequency_penalty : undefined,
       presencePenalty: typeof a.presence_penalty === "number" ? a.presence_penalty : undefined,
-      // Response enrichment
       languagePreference: a.language_preference as string | undefined,
       returnImages: typeof a.return_images === "boolean" ? a.return_images : undefined,
       returnRelatedQuestions: typeof a.return_related_questions === "boolean" ? a.return_related_questions : undefined,
@@ -453,34 +377,66 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     let result: string;
 
     if (name === "perplexity_search") {
+      if (!Array.isArray(a.search_domain_filter) || (a.search_domain_filter as string[]).length === 0) {
+        throw new Error("search_domain_filter is required for perplexity_search");
+      }
       result = await performChatCompletion({
         messages: [{ role: "user", content: a.query as string }],
         model: "sonar",
         recencyFilter: a.recency_filter as string | undefined,
         ...sharedOpts(),
       });
-    } else if (name === "perplexity_ask") {
-      result = await performChatCompletion({
-        messages: resolveMessages(),
-        model: "sonar-pro",
-        ...sharedOpts(),
-      });
+
     } else if (name === "perplexity_research") {
-      result = await performChatCompletion({
-        messages: resolveMessages(),
-        model: "sonar-deep-research",
-        stripThinking: (a.strip_thinking as boolean) ?? false,
-        ...sharedOpts(),
-      });
+      const id = makeJobId(query);
+      const query = a.query as string ?? (resolveMessages()[0]?.content ?? "");
+      const job: Job = { id, status: "pending", query, created: Date.now() };
+      writeJob(job);
+
+      // Spawn detached worker via CLI
+      const cliPath = new URL("./cli.ts", import.meta.url).pathname;
+      const proc = Bun.spawn(
+        [process.execPath, cliPath, "research", query, "--job-id", id,
+          ...(a.search_context_size ? ["--context-size", a.search_context_size as string] : []),
+          ...(a.search_mode ? ["--mode", a.search_mode as string] : []),
+          ...(a.search_type ? ["--type", a.search_type as string] : []),
+          ...(a.strip_thinking ? ["--strip-thinking"] : []),
+        ],
+        {
+          env: process.env as Record<string, string>,
+          stdin: null,
+          stdout: null,
+          stderr: null,
+          detached: true,
+        }
+      );
+      proc.unref();
+
+      result = `job:${id}  ${jobPath(id)}\n\nResearch started. Use perplexity_job_status to poll and perplexity_job_get to retrieve the result when done.`;
+
     } else if (name === "perplexity_reason") {
       result = await performChatCompletion({
         messages: resolveMessages(),
         model: "sonar-pro",
-        stripThinking: (a.strip_thinking as boolean) ?? false,
-        systemExtra:
-          "Think step-by-step. Evaluate all angles before concluding. Structure your response with clear sections.",
+        stripThinking: true,
+        systemExtra: "Think step-by-step. Evaluate all angles before concluding. Structure your response with clear sections.",
         ...sharedOpts(),
       });
+
+    } else if (name === "perplexity_job_status") {
+      const id = a.job_id as string;
+      const job = readJob(id);
+      if (!job) throw new Error(`job:${id} not found`);
+      result = job.status;
+
+    } else if (name === "perplexity_job_get") {
+      const id = a.job_id as string;
+      const job = readJob(id);
+      if (!job) throw new Error(`job:${id} not found`);
+      if (job.status === "pending") throw new Error(`job:${id} is still pending`);
+      if (job.status === "error") throw new Error(`job:${id} failed: ${job.error}`);
+      result = job.result!;
+
     } else {
       throw new Error(`Unknown tool: ${name}`);
     }
